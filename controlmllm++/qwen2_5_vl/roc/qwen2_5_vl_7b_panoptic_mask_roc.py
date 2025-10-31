@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPS = 1e-6
+EPS = 1e-3
 TEXT_KEYWORDS = {"text", "word", "letter", "character", "sign", "label"}
 
 
@@ -89,7 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", default="20,24", help="Decoder layer indices to aggregate (comma separated or 'all')")
     parser.add_argument("--heads", default="0,1,2,3,4,5,6,7", help="Attention head indices to aggregate (comma separated or 'all')")
     parser.add_argument("--steps", type=int, default=5, help="Number of visual prompt optimisation steps")
-    parser.add_argument("--lr", type=float, default=400.0, help="Learning rate for visual prompt updates")
+    parser.add_argument("--lr", type=float, default=0.02, help="Learning rate for visual prompt updates")
+    parser.add_argument("--alpha", type=float, default=400.0, help="Scaling factor for mask optimisation loss")
     parser.add_argument("--sigma", type=float, default=0.1, help="Smoothing term for mask-energy ratio")
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum tokens to generate for answers")
     parser.add_argument("--save-all", action="store_true", help="Save both pre/post overlays and token grids")
@@ -160,7 +161,7 @@ def refine_text_mask(mask: np.ndarray) -> np.ndarray:
     return (dilated > 0).astype(np.uint8)
 
 
-def compute_mask_energy(attn_hw: torch.Tensor, mask_tok: torch.Tensor, sigma: float = 0.1, eps: float = 1e-6) -> torch.Tensor:
+def compute_mask_energy(attn_hw: torch.Tensor, mask_tok: torch.Tensor, sigma: float = 0.1, eps: float = EPS) -> torch.Tensor:
     attn = attn_hw.float()
     mask = mask_tok.float()
     numerator = torch.sum(attn * mask)
@@ -185,7 +186,7 @@ def aggregate_attn_layers_heads(attn_list: Sequence[torch.Tensor], layers: Seque
     return stacked.mean(dim=0)
 
 
-def compute_ratio(attn_hw: torch.Tensor, mask_tok: torch.Tensor, eps: float = 1e-6) -> float:
+def compute_ratio(attn_hw: torch.Tensor, mask_tok: torch.Tensor, eps: float = EPS) -> float:
     attn = attn_hw.float()
     mask = mask_tok.float()
     numerator = torch.sum(attn * mask)
@@ -412,14 +413,14 @@ def main() -> None:
             for step in range(args.steps):
                 outputs = model(**inputs, output_attentions=True)
                 attn_map = extract_attn_map(outputs.attentions, layer_indices, head_indices, -1, vision_start, vision_end, grid_shape)[0]
-                energy = compute_mask_energy(attn_map, mask_tok_tensor, sigma=args.sigma, eps=EPS)
-                grad = torch.autograd.grad(energy, model.visual_prompt, retain_graph=False)[0]
+                loss = args.alpha * compute_mask_energy(attn_map, mask_tok_tensor, sigma=args.sigma, eps=EPS)
+                grad = torch.autograd.grad(loss, model.visual_prompt, retain_graph=False)[0]
                 state_m = beta1 * state_m + (1 - beta1) * grad
                 state_v = beta2 * state_v + (1 - beta2) * grad.pow(2)
                 m_hat = state_m / (1 - beta1 ** (step + 1))
                 v_hat = state_v / (1 - beta2 ** (step + 1))
                 with torch.no_grad():
-                    model.visual_prompt.add_(-args.lr * m_hat / (torch.sqrt(v_hat) + 1e-6))
+                    model.visual_prompt.add_(-args.lr * m_hat / (torch.sqrt(v_hat) + EPS))
 
             with torch.no_grad():
                 outputs_post = model(**inputs, output_attentions=True)
