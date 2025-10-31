@@ -9,3 +9,7 @@ gradio
 bitsandbytes
 accelerate
 git+https://github.com/openai/CLIP.git
+pycocotools
+numpy
+# Optional dependency for improved panoptic mask handling
+panopticapi
