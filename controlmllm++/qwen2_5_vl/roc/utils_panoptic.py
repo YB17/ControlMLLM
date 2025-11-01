@@ -74,7 +74,6 @@ def load_panoptic_index(panoptic_json: str) -> Dict[str, Dict[int, Dict[str, Any
                     "id": int(seg["id"]),
                     "category_id": int(seg["category_id"]),
                     "area": int(seg["area"]),
-                    "bbox": list(seg["bbox"]),
                     "iscrowd": bool(seg.get("iscrowd", 0)),
                 }
                 for seg in ann.get("segments_info", [])
