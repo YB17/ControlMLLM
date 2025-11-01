@@ -12,29 +12,29 @@ Example usage::
       --panoptic-json /data/coco/annotations/panoptic_val2017.json \
       --panoptic-mask-root /data/coco/annotations/panoptic_val2017 \
       --sample-image-ids 397133 \
-      --n-samples 5 \
-      --min-area 4096 \
-      --layers 12,28 \
+      --layers 20,24 \
       --heads 0,1,2,3,4,5,6,7 \
-      --steps 2 --lr 0.02 \
-      --outdir outputs/panoptic_val2017_demo \
-      --save-all
+      --steps 5 --lr 0.02 \
+      --hires-crop-size 448 --save-all
 
-The command above processes a single COCO image and saves pre/post optimisation
-attention overlays, token maps, ``npz`` dumps, and JSON summary lines under the
-``outputs/panoptic_val2017_demo/397133/`` directory.
+Definition of Done
+------------------
+* 左上角热点消失，且 KV 切片日志输出满足 ``end - start == h_tok * w_tok``
+* Query 集合非空，``summary.jsonl`` 中记录的比率 ``ratio_after`` 普遍高于 ``ratio_before``
+* CLI 示例可直接运行并输出 ``kv_slice_meta.json``、前/后 overlay、token 灰度图
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -45,8 +45,10 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 from qwen_utils import get_grid_shape
 from .utils_panoptic import (
+    compute_mask_bbox,
     draw_overlay_heatmap,
     downsample_mask_to_tokens,
+    extract_padded_crop,
     load_image,
     load_panoptic_index,
     load_panoptic_mask,
@@ -73,6 +75,21 @@ if compute_activation_loss is None:
 get_grid_shape_fn = getattr(roc_base, "get_grid_shape", get_grid_shape)
 EPS = 1e-3
 TEXT_KEYWORDS = {"text", "word", "letter", "character", "sign", "label"}
+
+
+LOGGER = logging.getLogger(__name__)
+KV_SLICE_LOGGED = False
+
+VERBALIZER_MAP: Dict[str, List[str]] = {
+    "cabinet": ["cabinet", "cupboard"],
+    "oven": ["oven", "stove"],
+    "sink": ["sink", "basin"],
+    "cup": ["cup", "mug"],
+    "toilet": ["toilet", "commode"],
+    "couch": ["sofa", "couch"],
+    "traffic light": ["traffic", "trafficlight"],
+    "tv": ["television", "tv"],
+}
 
 
 @dataclass
@@ -106,8 +123,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum tokens to generate for answers")
     parser.add_argument("--save-all", action="store_true", help="Save both pre/post overlays and token grids")
     parser.add_argument("--text-mask-mode", action="store_true", help="Enable text-specific mask refinement and exports")
-    parser.add_argument("--hires-crop-size", type=int, default=0, help="Optional crop size for high resolution text patches")
+    parser.add_argument("--hires-crop-size", type=int, default=0, help="Enable high resolution branch with the given crop size (0 disables)")
+    parser.add_argument("--small-mask-thr", type=int, default=0, help="Only enable high resolution branch when mask area is smaller than this (0 disables filtering)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
 
@@ -157,12 +176,82 @@ def slugify(value: str) -> str:
     return name or "unknown"
 
 
+def normalise_category_label(name: str) -> str:
+    """Normalise raw panoptic category names into readable labels."""
+
+    if not name:
+        return ""
+    lowered = name.lower().strip()
+    for suffix in ("_merged", "_stuff", "_thing"):
+        if lowered.endswith(suffix):
+            lowered = lowered[: -len(suffix)]
+            break
+    lowered = lowered.replace("_", " ").replace("-", " ")
+    lowered = " ".join(lowered.split())
+    return lowered
+
+
+def get_verbalizer_options(cat_name: Optional[str]) -> Tuple[str, List[str]]:
+    """Return normalised category label and candidate verbaliser options."""
+
+    normalised = normalise_category_label(cat_name or "")
+    if not normalised:
+        return "", []
+    options = VERBALIZER_MAP.get(normalised, None)
+    if options is None:
+        options = [normalised]
+    else:
+        options = list(dict.fromkeys(options + [normalised]))
+    fallback_no_space = normalised.replace(" ", "")
+    if fallback_no_space and fallback_no_space not in options:
+        options.append(fallback_no_space)
+    return normalised, options
+
+
+def match_answer_to_options(answer: str, options: Sequence[str]) -> str:
+    """Match a model answer against verbaliser options using simple heuristics."""
+
+    cleaned = "".join(ch for ch in answer.lower().strip() if ch.isalnum() or ch.isspace())
+    tokens = cleaned.split()
+    if not tokens:
+        return answer.strip()
+    candidate = tokens[0]
+    for option in options:
+        opt_lower = option.lower()
+        variants = {opt_lower, opt_lower.replace(" ", ""), opt_lower.rstrip("s")}
+        if any(candidate.startswith(var) or var.startswith(candidate) for var in variants if var):
+            return option
+    return candidate
+
+
+def build_prompt(cat_name: Optional[str]) -> Tuple[str, List[str], str]:
+    """Construct a single-word prompt and return verbaliser options and label."""
+
+    normalised, options = get_verbalizer_options(cat_name)
+    if options:
+        choices = ", ".join(sorted(dict.fromkeys(options)))
+        prompt = (
+            "Focus only on the object inside the provided mask. Choose one label "
+            f"from {{{choices}}}. Answer with exactly one word."
+        )
+    else:
+        prompt = (
+            "Focus only on the object inside the provided mask. What is the object? "
+            "Answer with a single noun."
+        )
+    return prompt, options, normalised
+
+
 def is_text_category(name: str) -> bool:
+    """Return ``True`` if the provided category name is text-like."""
+
     lowered = (name or "").lower()
     return any(keyword in lowered for keyword in TEXT_KEYWORDS)
 
 
 def refine_text_mask(mask: np.ndarray) -> np.ndarray:
+    """Apply light morphology to stabilise text masks when OpenCV is available."""
+
     if cv2 is None:
         return mask
     kernel = np.ones((3, 3), dtype=np.uint8)
@@ -172,36 +261,132 @@ def refine_text_mask(mask: np.ndarray) -> np.ndarray:
     return (dilated > 0).astype(np.uint8)
 
 
-def compute_token_attention(attn_list: Sequence[torch.Tensor], layer_indices: Sequence[int],
-                            head_indices: Sequence[int], query_index: int,
-                            vision_start: int, vision_end: int) -> torch.Tensor:
+def get_text_query_indices(input_ids: List[int], special_ids: Set[int], vision_start: int, vision_end: int) -> List[int]:
+    """Select textual query indices while excluding specials and the vision span."""
+
+    indices = [
+        idx
+        for idx, token_id in enumerate(input_ids)
+        if (idx < vision_start or idx >= vision_end) and token_id not in special_ids
+    ]
+    if not indices:
+        fallback = max(0, vision_end - 1)
+        indices.append(fallback)
+    return indices
+
+
+def compute_token_attention(
+    attn_list: Sequence[torch.Tensor],
+    layer_indices: Sequence[int],
+    head_indices: Sequence[int],
+    query_indices: Sequence[int],
+    vision_start: int,
+    vision_end: int,
+    grid_shape: Tuple[int, int],
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """Aggregate attentions over layers, heads, and textual queries.
+
+    Args:
+        attn_list: Sequence of attention tensors ``[(B, H, Q, K), ...]``.
+        layer_indices: Decoder layer indices to include.
+        head_indices: Optional attention head indices; averages over all heads when empty.
+        query_indices: Iterable of textual token indices used as query positions.
+        vision_start: Index of the first vision token.
+        vision_end: Index immediately after the last vision token.
+        grid_shape: Tuple ``(H_tok, W_tok)`` describing the vision token grid.
+
+    Returns:
+        A tuple of ``(token_att, meta)`` where ``token_att`` has shape ``(grid_len,)``
+        and ``meta`` contains the KV slicing diagnostics for logging and saving.
+    """
+
     if not attn_list:
         raise ValueError("Attention list is empty")
+    if not layer_indices:
+        raise ValueError("No layer indices provided")
+    if not query_indices:
+        raise ValueError("No query indices provided")
+
     selected_layers: List[torch.Tensor] = []
     for idx in layer_indices:
+        if idx < 0 or idx >= len(attn_list):
+            raise ValueError(f"Layer index {idx} out of range for {len(attn_list)} layers")
         layer_attn = attn_list[idx].to(DEVICE)
-        selected_layers.append(layer_attn)
-    stacked = torch.cat(selected_layers, dim=0)
-    attn_mean = stacked.mean(dim=0)
+        selected_layers.append(layer_attn.unsqueeze(0))
+    stacked = torch.cat(selected_layers, dim=0)  # (L, B, H, Q, K)
+    layer_mean = stacked.mean(dim=0)  # (B, H, Q, K)
+
     if head_indices:
-        attn_mean = attn_mean[head_indices, :, :]
-    token_slice = attn_mean[:, query_index, vision_start:vision_end]
-    return token_slice.mean(dim=0, keepdim=True)
+        head_tensor = layer_mean[:, head_indices, :, :]
+    else:
+        head_tensor = layer_mean
+    head_mean = head_tensor.mean(dim=1)  # (B, Q, K)
+
+    query_idx_tensor = torch.tensor(query_indices, device=head_mean.device, dtype=torch.long)
+    query_selected = torch.index_select(head_mean, dim=1, index=query_idx_tensor)
+    query_mean = query_selected.mean(dim=1)  # (B, K)
+
+    if query_mean.shape[0] != 1:
+        raise ValueError(f"Expected batch size 1, got {query_mean.shape[0]}")
+
+    kv_len = vision_end - vision_start
+    h_tok, w_tok = grid_shape
+    grid_len = int(h_tok * w_tok)
+    if grid_len <= 0:
+        raise RuntimeError(f"Invalid grid length {grid_len} from grid shape {grid_shape}")
+    start = vision_start + max(0, kv_len - grid_len)
+    end = start + grid_len
+    if end - start != grid_len or end > vision_end:
+        raise RuntimeError(
+            f"KV slicing mismatch: grid_len={grid_len}, kv_len={kv_len}, start={start}, end={end}, vision_end={vision_end}"
+        )
+
+    slice_meta: Dict[str, object] = {
+        "vision_start": int(vision_start),
+        "vision_end": int(vision_end),
+        "kv_start": int(start),
+        "kv_end": int(end),
+        "kv_len": int(kv_len),
+        "grid_len": int(grid_len),
+        "grid_shape": [int(h_tok), int(w_tok)],
+        "layers": [int(idx) for idx in layer_indices],
+        "heads": [int(idx) for idx in head_indices],
+        "query_indices": [int(idx) for idx in query_indices],
+    }
+
+    global KV_SLICE_LOGGED
+    if not KV_SLICE_LOGGED:
+        LOGGER.info(
+            "KV slice stats: kv_len=%d grid_len=%d start=%d end=%d",
+            slice_meta["kv_len"],
+            slice_meta["grid_len"],
+            slice_meta["kv_start"],
+            slice_meta["kv_end"],
+        )
+        KV_SLICE_LOGGED = True
+
+    token_slice = query_mean[0, start:end].contiguous()
+    return token_slice, slice_meta
 
 
 def token_attention_to_map(token_att: torch.Tensor, grid_shape: Tuple[int, int]) -> torch.Tensor:
+    """Reshape a flattened token attention vector back to ``(H_tok, W_tok)``."""
+
     h, w = grid_shape
     return token_att.reshape(h, w)
 
 
-def compute_attention_ratio(token_att: torch.Tensor, mask_tok: torch.Tensor,
-                            grid_shape: Tuple[int, int], eps: float = EPS) -> float:
+def compute_attention_ratio(
+    token_att: torch.Tensor, mask_tok: torch.Tensor, grid_shape: Tuple[int, int], eps: float = 1e-6
+) -> float:
+    """Compute the fraction of attention mass falling inside the mask tokens."""
+
     attn_map = token_attention_to_map(token_att, grid_shape)
     mask = mask_tok.float()
-    numerator = torch.sum(attn_map * mask)
-    denominator = torch.sum(attn_map)
+    numerator = float(torch.sum(attn_map * mask).item())
+    denominator = float(torch.sum(attn_map).item())
     ratio = (numerator + eps) / (denominator + eps)
-    return float(ratio.item())
+    return float(ratio)
 
 
 def ensure_dir(path: Path) -> None:
@@ -213,7 +398,7 @@ def save_image_safe(image: Image.Image, path: Path) -> None:
         ensure_dir(path.parent)
         image.save(path)
     except Exception as exc:  # pragma: no cover - IO guard
-        print(f"[WARN] Failed to save {path}: {exc}")
+        LOGGER.warning("Failed to save image %s: %s", path, exc)
 
 
 def save_token_map(attn_map: np.ndarray, path: Path) -> None:
@@ -225,7 +410,7 @@ def save_token_map(attn_map: np.ndarray, path: Path) -> None:
             norm = norm / denom
         Image.fromarray((norm * 255).astype(np.uint8)).save(path)
     except Exception as exc:  # pragma: no cover
-        print(f"[WARN] Failed to save token map {path}: {exc}")
+        LOGGER.warning("Failed to save token map %s: %s", path, exc)
 
 
 def append_summary(path: Path, record: InstanceRecord) -> None:
@@ -243,16 +428,11 @@ def append_summary(path: Path, record: InstanceRecord) -> None:
         }) + "\n")
 
 
-def build_prompt(cat_name: Optional[str]) -> str:
-    if cat_name:
-        return (
-            f"Focus on the object inside the given mask region. "
-            f"Is the object a {cat_name}? Answer with yes or no and briefly justify."
-        )
-    return "What object is inside the given mask region? Respond with a short phrase."
+def prepare_msgs(
+    image_path: str, prompt: str, highres_patch: Optional[Image.Image] = None
+) -> List[Dict[str, object]]:
+    """Prepare multimodal chat messages for the processor."""
 
-
-def prepare_msgs(image_path: str, prompt: str, highres_patch: Optional[Image.Image] = None) -> List[Dict[str, object]]:
     content: List[Dict[str, object]] = [
         {"type": "image", "image": image_path, "max_pixels": 512 * 28 * 28},
     ]
@@ -262,18 +442,33 @@ def prepare_msgs(image_path: str, prompt: str, highres_patch: Optional[Image.Ima
     return [{"role": "user", "content": content}]
 
 
-def prepare_inputs(processor: AutoProcessor, msgs: List[Dict[str, object]]) -> Tuple[Dict[str, torch.Tensor], Tuple[int, int], Tuple[int, int]]:
+def prepare_inputs(
+    processor: AutoProcessor, msgs: List[Dict[str, object]]
+) -> Tuple[Dict[str, torch.Tensor], Tuple[int, int], Tuple[int, int], List[int], Set[int]]:
+    """Tokenise inputs and extract vision token span metadata."""
+
     image_inputs, _ = process_vision_info(msgs)
     grid_shape = get_grid_shape_fn(processor, image_inputs)
     text_prompt = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[text_prompt], images=image_inputs, padding=True, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-    vision_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-    vision_end_token_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    tokenizer = processor.tokenizer
+    vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
     input_ids = inputs["input_ids"][0].tolist()
+    if vision_start_token_id not in input_ids or vision_end_token_id not in input_ids:
+        raise ValueError("Vision boundary tokens not found in the input sequence")
     vision_start = input_ids.index(vision_start_token_id) + 1
     vision_end = input_ids.index(vision_end_token_id)
-    return inputs, grid_shape, (vision_start, vision_end)
+    special_ids = set(tokenizer.all_special_ids or [])
+    LOGGER.info(
+        "Input sequence prepared: len=%d vision_start=%d vision_end=%d grid_shape=%s",
+        len(input_ids),
+        vision_start,
+        vision_end,
+        grid_shape,
+    )
+    return inputs, grid_shape, (vision_start, vision_end), input_ids, special_ids
 
 
 def select_images(index: Dict[str, Dict[int, Dict[str, object]]], image_ids_arg: str, n_samples: int) -> List[int]:
@@ -296,6 +491,11 @@ def select_images(index: Dict[str, Dict[int, Dict[str, object]]], image_ids_arg:
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
+    LOGGER.info("Initialising Panoptic ROC on device %s", DEVICE)
     set_seed(args.seed)
 
     index = load_panoptic_index(args.panoptic_json)
@@ -329,20 +529,20 @@ def main() -> None:
         image_meta = index["images"].get(image_id)
         ann_meta = index["anns"].get(image_id)
         if image_meta is None or ann_meta is None:
-            print(f"[WARN] Missing metadata for image {image_id}")
+            LOGGER.warning("Missing metadata for image %s", image_id)
             continue
 
         img_path = os.path.join(args.coco_img_root, image_meta["file_name"])
         try:
             image = load_image(args.coco_img_root, image_meta["file_name"])
         except FileNotFoundError:
-            print(f"[WARN] Image file not found: {img_path}")
+            LOGGER.warning("Image file not found: %s", img_path)
             continue
 
         try:
             seg_map = load_panoptic_mask(args.panoptic_mask_root, ann_meta["file_name"])
         except FileNotFoundError:
-            print(f"[WARN] Mask file not found for image {image_id}")
+            LOGGER.warning("Mask file not found for image %s", image_id)
             continue
 
         out_dir = Path(args.outdir) / str(image_id)
@@ -370,40 +570,77 @@ def main() -> None:
                 binary_mask = refine_text_mask(binary_mask)
 
             if binary_mask.sum() == 0:
+                LOGGER.debug("Skipping empty mask for image %s seg %s", image_id, seg_id)
                 continue
 
-            prompt = build_prompt(cat_name)
+            prompt, verbalizer_options, normalised_label = build_prompt(cat_name)
+            LOGGER.info("Prompt preview: %s", prompt[:120])
+            if normalised_label in {"cabinet", "oven", "sink", "cup"}:
+                LOGGER.info(
+                    "Verbalizer candidates for %s (%s): %s",
+                    cat_name or f"cat{cat_id}",
+                    normalised_label or "unknown",
+                    verbalizer_options,
+                )
+
             highres_patch: Optional[Image.Image] = None
-            if args.text_mask_mode and args.hires_crop_size > 0 and is_text_category(cat_name):
-                if cv2 is not None:
-                    ys, xs = np.where(binary_mask > 0)
-                    if len(xs) and len(ys):
-                        x0, x1 = xs.min(), xs.max()
-                        y0, y1 = ys.min(), ys.max()
-                        pad = int(0.05 * max(x1 - x0 + 1, y1 - y0 + 1))
-                        x0 = max(0, x0 - pad)
-                        y0 = max(0, y0 - pad)
-                        x1 = min(binary_mask.shape[1] - 1, x1 + pad)
-                        y1 = min(binary_mask.shape[0] - 1, y1 + pad)
-                        crop = image.crop((x0, y0, x1 + 1, y1 + 1))
-                        highres_patch = crop.resize((args.hires_crop_size, args.hires_crop_size), Image.BICUBIC)
+            enable_hires = False
+            if args.hires_crop_size > 0 and (args.small_mask_thr <= 0 or area < args.small_mask_thr):
+                try:
+                    bbox = compute_mask_bbox(binary_mask, padding=0.05)
+                    highres_patch = extract_padded_crop(image, bbox, args.hires_crop_size)
+                    enable_hires = True
+                except ValueError as exc:
+                    LOGGER.warning(
+                        "High-res crop failed for image %s seg %s: %s",
+                        image_id,
+                        seg_id,
+                        exc,
+                    )
+            if enable_hires and highres_patch is not None:
+                LOGGER.info(
+                    "High-res branch enabled for image %s seg %s: area=%d crop_size=%s",
+                    image_id,
+                    seg_id,
+                    area,
+                    highres_patch.size,
+                )
 
             msgs = prepare_msgs(img_path, prompt, highres_patch)
             try:
-                inputs, grid_shape, (vision_start, vision_end) = prepare_inputs(processor, msgs)
+                inputs, grid_shape, (vision_start, vision_end), input_ids, special_ids = prepare_inputs(processor, msgs)
             except ValueError as exc:
-                print(f"[WARN] Failed to prepare inputs for image {image_id}: {exc}")
+                LOGGER.warning("Failed to prepare inputs for image %s seg %s: %s", image_id, seg_id, exc)
                 continue
+
+            query_indices = get_text_query_indices(input_ids, special_ids, vision_start, vision_end)
+            head_sample = query_indices[:3]
+            tail_sample = query_indices[-3:] if len(query_indices) > 3 else query_indices[:]
+            LOGGER.info(
+                "Query indices count=%d head=%s tail=%s",
+                len(query_indices),
+                head_sample,
+                tail_sample,
+            )
 
             h_tok, w_tok = grid_shape
             mask_tokens = downsample_mask_to_tokens(binary_mask, h_tok, w_tok)
             if mask_tokens.sum() <= 0:
+                LOGGER.debug("Token mask empty after downsampling for image %s seg %s", image_id, seg_id)
                 continue
             mask_tok_tensor = torch.from_numpy(mask_tokens).to(DEVICE).float()
 
             with torch.no_grad():
                 outputs = model(**inputs, output_attentions=True)
-            token_att_pre = compute_token_attention(outputs.attentions, layer_indices, head_indices, -1, vision_start, vision_end)
+            token_att_pre, kv_meta = compute_token_attention(
+                outputs.attentions,
+                layer_indices,
+                head_indices,
+                query_indices,
+                vision_start,
+                vision_end,
+                grid_shape,
+            )
             ratio_before = compute_attention_ratio(token_att_pre, mask_tok_tensor, grid_shape)
 
             num_tokens = h_tok * w_tok
@@ -423,8 +660,16 @@ def main() -> None:
 
             for _ in range(args.steps):
                 outputs = model(**inputs, output_attentions=True)
-                token_att = compute_token_attention(outputs.attentions, layer_indices, head_indices, -1, vision_start, vision_end)
-                loss = args.alpha * compute_activation_loss(token_att, [mask_tok_tensor])
+                token_att, _ = compute_token_attention(
+                    outputs.attentions,
+                    layer_indices,
+                    head_indices,
+                    query_indices,
+                    vision_start,
+                    vision_end,
+                    grid_shape,
+                )
+                loss = args.alpha * compute_activation_loss(token_att.unsqueeze(0), [mask_tok_tensor])
                 grad = torch.autograd.grad(loss, model.visual_prompt, retain_graph=False)[0]
                 state['m'] = beta1 * state['m'] + (1 - beta1) * grad
                 state['s'] = beta2 * state['s'] + (1 - beta2) * grad.pow(2)
@@ -438,7 +683,15 @@ def main() -> None:
 
             with torch.no_grad():
                 outputs_post = model(**inputs, output_attentions=True)
-                token_att_post = compute_token_attention(outputs_post.attentions, layer_indices, head_indices, -1, vision_start, vision_end)
+                token_att_post, _ = compute_token_attention(
+                    outputs_post.attentions,
+                    layer_indices,
+                    head_indices,
+                    query_indices,
+                    vision_start,
+                    vision_end,
+                    grid_shape,
+                )
                 ratio_after = compute_attention_ratio(token_att_post, mask_tok_tensor, grid_shape)
                 # 临时保存并移除visual_prompt以避免generate时的设备冲突
                 saved_prompt = model.visual_prompt
@@ -447,13 +700,23 @@ def main() -> None:
                 model.visual_prompt = saved_prompt  # 恢复
                 trimmed = [out[len(inp):] for inp, out in zip(inputs["input_ids"], generated_ids)]
                 decoded = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                answer = decoded[0] if decoded else ""
+                raw_answer = decoded[0] if decoded else ""
+
+            LOGGER.info("Raw answer: %s", raw_answer.strip())
+            parsed_answer = match_answer_to_options(raw_answer, verbalizer_options)
+            LOGGER.info(
+                "Attention ratio %.3f -> %.3f (Δ=%.3f) | parsed=%s",
+                ratio_before,
+                ratio_after,
+                ratio_after - ratio_before,
+                parsed_answer,
+            )
 
             ratio_gains.append(ratio_after - ratio_before)
             processed_instances += 1
 
-            attn_pre_np = token_attention_to_map(token_att_pre, grid_shape).detach().cpu().numpy()
-            attn_post_np = token_attention_to_map(token_att_post, grid_shape).detach().cpu().numpy()
+            attn_pre_np = token_attention_to_map(token_att_pre.detach(), grid_shape).cpu().numpy()
+            attn_post_np = token_attention_to_map(token_att_post.detach(), grid_shape).cpu().numpy()
 
             overlay_pre = draw_overlay_heatmap(image, upsample_attn_to_image(attn_pre_np, image.height, image.width))
             overlay_post = draw_overlay_heatmap(image, upsample_attn_to_image(attn_post_np, image.height, image.width))
@@ -472,12 +735,25 @@ def main() -> None:
                 ensure_dir(npz_path.parent)
                 np.savez_compressed(npz_path, attn_pre=attn_pre_np, attn_post=attn_post_np, mask_tokens=mask_tokens)
             except Exception as exc:  # pragma: no cover
-                print(f"[WARN] Failed to save attention arrays for {npz_path}: {exc}")
+                LOGGER.warning("Failed to save attention arrays for %s: %s", npz_path, exc)
 
             if args.text_mask_mode and is_text_category(cat_name):
                 text_mask = refine_text_mask(binary_mask)
                 text_overlay = draw_overlay_heatmap(image, upsample_attn_to_image(text_mask.astype(np.float32), image.height, image.width))
                 save_image_safe(text_overlay, out_dir / f"{prefix}_text_overlay.png")
+
+            kv_meta_path = out_dir / f"{prefix}_kv_slice_meta.json"
+            kv_meta_out = dict(kv_meta)
+            kv_meta_out.update({
+                "ratio_before": ratio_before,
+                "ratio_after": ratio_after,
+            })
+            try:
+                ensure_dir(kv_meta_path.parent)
+                with kv_meta_path.open("w", encoding="utf-8") as fp:
+                    json.dump(kv_meta_out, fp, indent=2)
+            except Exception as exc:  # pragma: no cover
+                LOGGER.warning("Failed to save KV metadata for %s: %s", kv_meta_path, exc)
 
             record = InstanceRecord(
                 image_id=image_id,
@@ -485,27 +761,35 @@ def main() -> None:
                 category_id=cat_id,
                 category_name=cat_name,
                 prompt=prompt,
-                answer=answer,
+                answer=parsed_answer,
                 ratio_before=ratio_before,
                 ratio_after=ratio_after,
             )
             append_summary(summary_path, record)
 
-            print(f"[INFO] image {image_id} seg {seg_id} ({cat_slug}) ratio {ratio_before:.3f} -> {ratio_after:.3f} | {answer}")
+            LOGGER.info(
+                "image %s seg %s (%s) ratio %.3f -> %.3f | %s",
+                image_id,
+                seg_id,
+                cat_slug,
+                ratio_before,
+                ratio_after,
+                parsed_answer,
+            )
 
     if processed_instances:
         gains = np.array(ratio_gains, dtype=np.float32)
         mean_gain = float(gains.mean())
         median_gain = float(np.median(gains))
         positive_rate = float((gains > 0).mean())
-        print("=== Summary ===")
-        print(f"Total instances: {total_instances}")
-        print(f"Processed instances: {processed_instances}")
-        print(f"Average ratio improvement: {mean_gain:.4f}")
-        print(f"Median ratio improvement: {median_gain:.4f}")
-        print(f"Improvement ratio>0: {positive_rate * 100:.2f}%")
+        LOGGER.info("=== Summary ===")
+        LOGGER.info("Total instances: %d", total_instances)
+        LOGGER.info("Processed instances: %d", processed_instances)
+        LOGGER.info("Average ratio improvement: %.4f", mean_gain)
+        LOGGER.info("Median ratio improvement: %.4f", median_gain)
+        LOGGER.info("Improvement ratio>0: %.2f%%", positive_rate * 100.0)
     else:
-        print("No valid instances were processed.")
+        LOGGER.info("No valid instances were processed.")
 
 
 if __name__ == "__main__":

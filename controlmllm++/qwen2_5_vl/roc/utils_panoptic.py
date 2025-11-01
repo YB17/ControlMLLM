@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 from PIL import Image
@@ -130,6 +130,46 @@ def mask_from_segment_id(seg_id_map: np.ndarray, target_sid: int) -> np.ndarray:
     return mask
 
 
+def compute_mask_bbox(binary_mask: np.ndarray, padding: float = 0.05) -> Tuple[int, int, int, int]:
+    """Compute a padded bounding box for a binary mask."""
+
+    if binary_mask.ndim != 2:
+        raise ValueError("Binary mask must be 2D")
+    ys, xs = np.nonzero(binary_mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        raise ValueError("Mask is empty")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    pad_x = int(round(width * padding))
+    pad_y = int(round(height * padding))
+    h, w = binary_mask.shape
+    x0 = max(0, x0 - pad_x)
+    y0 = max(0, y0 - pad_y)
+    x1 = min(w - 1, x1 + pad_x)
+    y1 = min(h - 1, y1 + pad_y)
+    return x0, y0, x1, y1
+
+
+def extract_padded_crop(image: Image.Image, bbox: Tuple[int, int, int, int], crop_size: int) -> Image.Image:
+    """Extract and resize a crop defined by an inclusive bounding box."""
+
+    if crop_size <= 0:
+        raise ValueError("crop_size must be positive")
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    width, height = image.size
+    x0 = max(0, min(x0, width - 1))
+    y0 = max(0, min(y0, height - 1))
+    x1 = max(x0, min(x1, width - 1))
+    y1 = max(y0, min(y1, height - 1))
+    crop_box = (x0, y0, x1 + 1, y1 + 1)
+    crop = image.crop(crop_box)
+    if crop.size != (crop_size, crop_size):
+        crop = crop.resize((crop_size, crop_size), Image.BICUBIC)
+    return crop
+
+
 def _resize_array(arr: np.ndarray, shape: tuple[int, int], mode: str) -> np.ndarray:
     if cv2 is not None:
         if mode == "down":
@@ -188,6 +228,8 @@ __all__ = [
     "load_image",
     "load_panoptic_mask",
     "mask_from_segment_id",
+    "compute_mask_bbox",
+    "extract_padded_crop",
     "downsample_mask_to_tokens",
     "upsample_attn_to_image",
     "draw_overlay_heatmap",
