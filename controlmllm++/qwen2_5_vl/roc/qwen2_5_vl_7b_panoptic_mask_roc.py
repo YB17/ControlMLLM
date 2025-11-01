@@ -12,7 +12,7 @@ Example usage::
       --panoptic-json /data/coco/annotations/panoptic_val2017.json \
       --panoptic-mask-root /data/coco/annotations/panoptic_val2017 \
       --sample-image-ids 397133 \
-      --n-samples 1 \
+      --n-samples 5 \
       --min-area 4096 \
       --layers 12,28 \
       --heads 0,1,2,3,4,5,6,7 \
@@ -44,7 +44,7 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from qwen_vl_utils import process_vision_info
 from qwen_utils import get_grid_shape
-from utils_panoptic import (
+from .utils_panoptic import (
     draw_overlay_heatmap,
     downsample_mask_to_tokens,
     load_image,
@@ -89,7 +89,7 @@ class InstanceRecord:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Panoptic mask ROC evaluation")
-    parser.add_argument("--model-path", default="pretrained_models/Qwen2.5-VL-7B-Instruct")
+    parser.add_argument("--model-path", default="/home/host/qwen2.5-vl")
     parser.add_argument("--coco-img-root", required=True, help="COCO image root directory")
     parser.add_argument("--panoptic-json", required=True, help="Path to panoptic JSON file")
     parser.add_argument("--panoptic-mask-root", required=True, help="Directory with panoptic PNG masks")
@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-area", type=int, default=4096, help="Skip segments with area smaller than this")
     parser.add_argument("--category-filter", default="", help="Comma separated category names or ids to keep")
     parser.add_argument("--outdir", default="outputs/panoptic_mask", help="Directory for saving outputs")
-    parser.add_argument("--layers", default="12,28", help="Decoder layer indices to aggregate (comma separated or 'all')")
+    parser.add_argument("--layers", default="11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27", help="Decoder layer indices to aggregate (comma separated or 'all')")
     parser.add_argument("--heads", default="0,1,2,3,4,5,6,7", help="Attention head indices to aggregate (comma separated or 'all')")
     parser.add_argument("--steps", type=int, default=5, help="Number of visual prompt optimisation steps")
     parser.add_argument("--lr", type=float, default=0.02, help="Learning rate for visual prompt updates")
@@ -407,7 +407,13 @@ def main() -> None:
             ratio_before = compute_attention_ratio(token_att_pre, mask_tok_tensor, grid_shape)
 
             num_tokens = h_tok * w_tok
-            model.visual_prompt = torch.nn.Parameter(torch.zeros((num_tokens, model.config.hidden_size), dtype=model.dtype, device=DEVICE))
+            # model.visual_prompt = torch.nn.Parameter(torch.zeros((num_tokens, model.config.hidden_size), dtype=model.dtype, device=DEVICE))
+            # 使用inputs所在的设备（主模型设备）
+            inputs_device = inputs['input_ids'].device
+            model.visual_prompt = torch.nn.Parameter(
+                torch.zeros((num_tokens, model.config.hidden_size), 
+                            dtype=model.dtype, device=inputs_device)
+            )
             beta1, beta2, eps = 0.9, 0.999, EPS
             hyperparams = {'lr': args.lr, 't': 1}
             state = {
@@ -425,7 +431,7 @@ def main() -> None:
                 m_hat = state['m'] / (1 - beta1 ** hyperparams['t'])
                 s_hat = state['s'] / (1 - beta2 ** hyperparams['t'])
                 with torch.no_grad():
-                    model.visual_prompt = model.visual_prompt - hyperparams['lr'] * m_hat / (torch.sqrt(s_hat) + eps)
+                    model.visual_prompt.data = model.visual_prompt.data - hyperparams['lr'] * m_hat / (torch.sqrt(s_hat) + eps)
                 hyperparams['t'] += 1
                 if DEVICE.type == "cuda":
                     torch.cuda.empty_cache()
@@ -434,7 +440,11 @@ def main() -> None:
                 outputs_post = model(**inputs, output_attentions=True)
                 token_att_post = compute_token_attention(outputs_post.attentions, layer_indices, head_indices, -1, vision_start, vision_end)
                 ratio_after = compute_attention_ratio(token_att_post, mask_tok_tensor, grid_shape)
+                # 临时保存并移除visual_prompt以避免generate时的设备冲突
+                saved_prompt = model.visual_prompt
+                model.visual_prompt = None
                 generated_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
+                model.visual_prompt = saved_prompt  # 恢复
                 trimmed = [out[len(inp):] for inp, out in zip(inputs["input_ids"], generated_ids)]
                 decoded = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
                 answer = decoded[0] if decoded else ""
