@@ -89,6 +89,38 @@ VERBALIZER_MAP: Dict[str, List[str]] = {
     "couch": ["sofa", "couch"],
     "traffic light": ["traffic", "trafficlight"],
     "tv": ["television", "tv"],
+
+    "wall-brick": ["brick wall"],
+    "wall-stone": ["stone wall"],
+    "wall-tile": ["tiled wall"],
+    "wall-wood": ["wooden wall"],
+
+    "water-other": ["water"],
+    "window-blind": ["window blinds"],
+    "window-other": ["window"],
+
+    "tree-merged": ["trees"],
+    "fence-merged": ["fence"],
+    "ceiling-merged": ["ceiling"],
+    "sky-other-merged": ["sky"],
+    "cabinet-merged": ["cabinet"],
+    "table-merged": ["table"],
+    "floor-other-merged": ["floor"],
+    "pavement-merged": ["pavement"],
+    "mountain-merged": ["mountains"],
+    "grass-merged": ["grass"],
+    "dirt-merged": ["dirt ground"],
+    "paper-merged": ["paper"],
+    "food-other-merged": ["food"],
+    "building-other-merged": ["building"],
+    "rock-merged": ["rocks"],
+    "wall-other-merged": ["wall"],
+    "rug-merged": ["rug"],
+
+    "mirror-stuff": ["mirror"],
+    "door-stuff": ["door"],
+    "floor-wood": ["wooden floor"],
+
 }
 
 
@@ -231,12 +263,12 @@ def build_prompt(cat_name: Optional[str]) -> Tuple[str, List[str], str]:
     if options:
         choices = ", ".join(sorted(dict.fromkeys(options)))
         prompt = (
-            "Focus only on the object inside the provided mask. Choose one label "
+            "Focus only on the object outlined by the provided mask. Note that the object might be either for-ground related, e.g. an apple, a person or a car, or back-ground related, e.g. trees, sky, walls, ceiling. Think carefully before you answer the question: Choose one label "
             f"from {{{choices}}}. Answer with exactly one word."
         )
     else:
         prompt = (
-            "Focus only on the object inside the provided mask. What is the object? "
+            "Focus only on the object outlined by the provided mask. Note that the object might be either for-ground related, e.g. an apple, a person or a car, or back-ground related, e.g. trees, sky, walls, ceiling. Think carefully before you answer the question: What is the object? "
             "Answer with a single noun."
         )
     return prompt, options, normalised
@@ -575,13 +607,13 @@ def main() -> None:
 
             prompt, verbalizer_options, normalised_label = build_prompt(cat_name)
             LOGGER.info("Prompt preview: %s", prompt[:120])
-            if normalised_label in {"cabinet", "oven", "sink", "cup"}:
-                LOGGER.info(
-                    "Verbalizer candidates for %s (%s): %s",
-                    cat_name or f"cat{cat_id}",
-                    normalised_label or "unknown",
-                    verbalizer_options,
-                )
+            # if normalised_label in {"cabinet", "oven", "sink", "cup"}:
+            #     LOGGER.info(
+            #         "Verbalizer candidates for %s (%s): %s",
+            #         cat_name or f"cat{cat_id}",
+            #         normalised_label or "unknown",
+            #         verbalizer_options,
+            #     )
 
             highres_patch: Optional[Image.Image] = None
             enable_hires = False
@@ -643,7 +675,8 @@ def main() -> None:
             )
             ratio_before = compute_attention_ratio(token_att_pre, mask_tok_tensor, grid_shape)
 
-            num_tokens = h_tok * w_tok
+            # num_tokens = h_tok * w_tok
+            num_tokens = vision_end - vision_start  # 使用实际的vision token范围
             # model.visual_prompt = torch.nn.Parameter(torch.zeros((num_tokens, model.config.hidden_size), dtype=model.dtype, device=DEVICE))
             # 使用inputs所在的设备（主模型设备）
             inputs_device = inputs['input_ids'].device
