@@ -2,8 +2,8 @@
 
 This script extends the bounding-box ROC workflow to COCO Panoptic masks. It reads
 Panoptic annotations, selects segments, formulates mask-aware questions, optimises
-visual prompt tokens with a mask-energy objective, and stores visualisations and
-metrics for further analysis.
+visual prompt tokens with the same activation objective used in ``qwen2_5_vl_7b_roc.py``,
+and stores visualisations and metrics for further analysis.
 
 Example usage::
 
@@ -14,9 +14,9 @@ Example usage::
       --sample-image-ids 397133 \
       --n-samples 1 \
       --min-area 4096 \
-      --layers 20,24 \
+      --layers 12,28 \
       --heads 0,1,2,3,4,5,6,7 \
-      --steps 5 --lr 400 \
+      --steps 2 --lr 0.02 \
       --outdir outputs/panoptic_val2017_demo \
       --save-all
 
@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -58,7 +59,18 @@ try:  # pragma: no cover - optional import for text mask refinement
 except Exception:  # pragma: no cover
     cv2 = None
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.append(str(CURRENT_DIR))
+
+import qwen2_5_vl_7b_roc as roc_base  # type: ignore
+
+DEVICE = torch.device(getattr(roc_base, "device", "cuda" if torch.cuda.is_available() else "cpu"))
+compute_activation_loss = getattr(roc_base, "compute_activation_loss_qwen", None)
+if compute_activation_loss is None:
+    from qwen_utils import compute_activation_loss_qwen as compute_activation_loss  # type: ignore
+get_grid_shape_fn = getattr(roc_base, "get_grid_shape", get_grid_shape)
 EPS = 1e-3
 TEXT_KEYWORDS = {"text", "word", "letter", "character", "sign", "label"}
 
@@ -86,12 +98,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-area", type=int, default=4096, help="Skip segments with area smaller than this")
     parser.add_argument("--category-filter", default="", help="Comma separated category names or ids to keep")
     parser.add_argument("--outdir", default="outputs/panoptic_mask", help="Directory for saving outputs")
-    parser.add_argument("--layers", default="20,24", help="Decoder layer indices to aggregate (comma separated or 'all')")
+    parser.add_argument("--layers", default="12,28", help="Decoder layer indices to aggregate (comma separated or 'all')")
     parser.add_argument("--heads", default="0,1,2,3,4,5,6,7", help="Attention head indices to aggregate (comma separated or 'all')")
     parser.add_argument("--steps", type=int, default=5, help="Number of visual prompt optimisation steps")
     parser.add_argument("--lr", type=float, default=0.02, help="Learning rate for visual prompt updates")
     parser.add_argument("--alpha", type=float, default=400.0, help="Scaling factor for mask optimisation loss")
-    parser.add_argument("--sigma", type=float, default=0.1, help="Smoothing term for mask-energy ratio")
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum tokens to generate for answers")
     parser.add_argument("--save-all", action="store_true", help="Save both pre/post overlays and token grids")
     parser.add_argument("--text-mask-mode", action="store_true", help="Enable text-specific mask refinement and exports")
@@ -161,46 +172,36 @@ def refine_text_mask(mask: np.ndarray) -> np.ndarray:
     return (dilated > 0).astype(np.uint8)
 
 
-def compute_mask_energy(attn_hw: torch.Tensor, mask_tok: torch.Tensor, sigma: float = 0.1, eps: float = EPS) -> torch.Tensor:
-    attn = attn_hw.float()
-    mask = mask_tok.float()
-    numerator = torch.sum(attn * mask)
-    denominator = torch.sum(attn)
-    ratio = (numerator + sigma) / (denominator + sigma + eps)
-    return torch.square(1.0 - ratio)
-
-
-def aggregate_attn_layers_heads(attn_list: Sequence[torch.Tensor], layers: Sequence[int], heads: Sequence[int]) -> torch.Tensor:
+def compute_token_attention(attn_list: Sequence[torch.Tensor], layer_indices: Sequence[int],
+                            head_indices: Sequence[int], query_index: int,
+                            vision_start: int, vision_end: int) -> torch.Tensor:
     if not attn_list:
         raise ValueError("Attention list is empty")
-    layer_indices = list(layers) if layers else list(range(len(attn_list)))
-    head_indices = list(heads)
-    aggregated: List[torch.Tensor] = []
+    selected_layers: List[torch.Tensor] = []
     for idx in layer_indices:
-        attn = attn_list[idx]
-        if head_indices:
-            attn = attn[:, head_indices, :, :]
-        attn_mean = attn.mean(dim=1)
-        aggregated.append(attn_mean)
-    stacked = torch.stack(aggregated, dim=0)
-    return stacked.mean(dim=0)
+        layer_attn = attn_list[idx].to(DEVICE)
+        selected_layers.append(layer_attn)
+    stacked = torch.cat(selected_layers, dim=0)
+    attn_mean = stacked.mean(dim=0)
+    if head_indices:
+        attn_mean = attn_mean[head_indices, :, :]
+    token_slice = attn_mean[:, query_index, vision_start:vision_end]
+    return token_slice.mean(dim=0, keepdim=True)
 
 
-def compute_ratio(attn_hw: torch.Tensor, mask_tok: torch.Tensor, eps: float = EPS) -> float:
-    attn = attn_hw.float()
+def token_attention_to_map(token_att: torch.Tensor, grid_shape: Tuple[int, int]) -> torch.Tensor:
+    h, w = grid_shape
+    return token_att.reshape(h, w)
+
+
+def compute_attention_ratio(token_att: torch.Tensor, mask_tok: torch.Tensor,
+                            grid_shape: Tuple[int, int], eps: float = EPS) -> float:
+    attn_map = token_attention_to_map(token_att, grid_shape)
     mask = mask_tok.float()
-    numerator = torch.sum(attn * mask)
-    denominator = torch.sum(attn)
+    numerator = torch.sum(attn_map * mask)
+    denominator = torch.sum(attn_map)
     ratio = (numerator + eps) / (denominator + eps)
     return float(ratio.item())
-
-
-def extract_attn_map(attn_list: Sequence[torch.Tensor], layers: Sequence[int], heads: Sequence[int],
-                     query_index: int, vision_start: int, vision_end: int, grid_shape: Tuple[int, int]) -> torch.Tensor:
-    attn = aggregate_attn_layers_heads(attn_list, layers, heads)
-    attn_slice = attn[:, query_index, vision_start:vision_end]
-    h, w = grid_shape
-    return attn_slice.reshape(attn_slice.shape[0], h, w)
 
 
 def ensure_dir(path: Path) -> None:
@@ -263,7 +264,7 @@ def prepare_msgs(image_path: str, prompt: str, highres_patch: Optional[Image.Ima
 
 def prepare_inputs(processor: AutoProcessor, msgs: List[Dict[str, object]]) -> Tuple[Dict[str, torch.Tensor], Tuple[int, int], Tuple[int, int]]:
     image_inputs, _ = process_vision_info(msgs)
-    grid_shape = get_grid_shape(processor, image_inputs)
+    grid_shape = get_grid_shape_fn(processor, image_inputs)
     text_prompt = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[text_prompt], images=image_inputs, padding=True, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
@@ -398,34 +399,41 @@ def main() -> None:
             mask_tokens = downsample_mask_to_tokens(binary_mask, h_tok, w_tok)
             if mask_tokens.sum() <= 0:
                 continue
-            mask_tok_tensor = torch.from_numpy(mask_tokens).to(DEVICE)
+            mask_tok_tensor = torch.from_numpy(mask_tokens).to(DEVICE).float()
 
             with torch.no_grad():
                 outputs = model(**inputs, output_attentions=True)
-            attn_pre = extract_attn_map(outputs.attentions, layer_indices, head_indices, -1, vision_start, vision_end, grid_shape)[0]
-            ratio_before = compute_ratio(attn_pre, mask_tok_tensor)
+            token_att_pre = compute_token_attention(outputs.attentions, layer_indices, head_indices, -1, vision_start, vision_end)
+            ratio_before = compute_attention_ratio(token_att_pre, mask_tok_tensor, grid_shape)
 
-            model.visual_prompt = torch.nn.Parameter(torch.zeros((h_tok * w_tok, model.config.hidden_size), dtype=model.dtype, device=DEVICE))
-            beta1, beta2 = 0.9, 0.999
-            state_m = torch.zeros_like(model.visual_prompt)
-            state_v = torch.zeros_like(model.visual_prompt)
+            num_tokens = h_tok * w_tok
+            model.visual_prompt = torch.nn.Parameter(torch.zeros((num_tokens, model.config.hidden_size), dtype=model.dtype, device=DEVICE))
+            beta1, beta2, eps = 0.9, 0.999, EPS
+            hyperparams = {'lr': args.lr, 't': 1}
+            state = {
+                'm': torch.zeros_like(model.visual_prompt),
+                's': torch.zeros_like(model.visual_prompt),
+            }
 
-            for step in range(args.steps):
+            for _ in range(args.steps):
                 outputs = model(**inputs, output_attentions=True)
-                attn_map = extract_attn_map(outputs.attentions, layer_indices, head_indices, -1, vision_start, vision_end, grid_shape)[0]
-                loss = args.alpha * compute_mask_energy(attn_map, mask_tok_tensor, sigma=args.sigma, eps=EPS)
+                token_att = compute_token_attention(outputs.attentions, layer_indices, head_indices, -1, vision_start, vision_end)
+                loss = args.alpha * compute_activation_loss(token_att, [mask_tok_tensor])
                 grad = torch.autograd.grad(loss, model.visual_prompt, retain_graph=False)[0]
-                state_m = beta1 * state_m + (1 - beta1) * grad
-                state_v = beta2 * state_v + (1 - beta2) * grad.pow(2)
-                m_hat = state_m / (1 - beta1 ** (step + 1))
-                v_hat = state_v / (1 - beta2 ** (step + 1))
+                state['m'] = beta1 * state['m'] + (1 - beta1) * grad
+                state['s'] = beta2 * state['s'] + (1 - beta2) * grad.pow(2)
+                m_hat = state['m'] / (1 - beta1 ** hyperparams['t'])
+                s_hat = state['s'] / (1 - beta2 ** hyperparams['t'])
                 with torch.no_grad():
-                    model.visual_prompt.add_(-args.lr * m_hat / (torch.sqrt(v_hat) + EPS))
+                    model.visual_prompt = model.visual_prompt - hyperparams['lr'] * m_hat / (torch.sqrt(s_hat) + eps)
+                hyperparams['t'] += 1
+                if DEVICE.type == "cuda":
+                    torch.cuda.empty_cache()
 
             with torch.no_grad():
                 outputs_post = model(**inputs, output_attentions=True)
-                attn_post = extract_attn_map(outputs_post.attentions, layer_indices, head_indices, -1, vision_start, vision_end, grid_shape)[0]
-                ratio_after = compute_ratio(attn_post, mask_tok_tensor)
+                token_att_post = compute_token_attention(outputs_post.attentions, layer_indices, head_indices, -1, vision_start, vision_end)
+                ratio_after = compute_attention_ratio(token_att_post, mask_tok_tensor, grid_shape)
                 generated_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
                 trimmed = [out[len(inp):] for inp, out in zip(inputs["input_ids"], generated_ids)]
                 decoded = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
@@ -434,8 +442,8 @@ def main() -> None:
             ratio_gains.append(ratio_after - ratio_before)
             processed_instances += 1
 
-            attn_pre_np = attn_pre.detach().cpu().numpy()
-            attn_post_np = attn_post.detach().cpu().numpy()
+            attn_pre_np = token_attention_to_map(token_att_pre, grid_shape).detach().cpu().numpy()
+            attn_post_np = token_attention_to_map(token_att_post, grid_shape).detach().cpu().numpy()
 
             overlay_pre = draw_overlay_heatmap(image, upsample_attn_to_image(attn_pre_np, image.height, image.width))
             overlay_post = draw_overlay_heatmap(image, upsample_attn_to_image(attn_post_np, image.height, image.width))
