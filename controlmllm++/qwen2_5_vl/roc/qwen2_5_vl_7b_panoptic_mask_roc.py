@@ -157,6 +157,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-mask-mode", action="store_true", help="Enable text-specific mask refinement and exports")
     parser.add_argument("--hires-crop-size", type=int, default=0, help="Enable high resolution branch with the given crop size (0 disables)")
     parser.add_argument("--small-mask-thr", type=int, default=0, help="Only enable high resolution branch when mask area is smaller than this (0 disables filtering)")
+    parser.add_argument(
+        "--hires-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When enabled (default), prefer the high-resolution vision span whenever available.",
+    )
+    parser.add_argument(
+        "--span-idx",
+        type=int,
+        default=None,
+        help="Optional explicit vision span index to use when --no-hires-only is set.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
@@ -291,6 +303,27 @@ def refine_text_mask(mask: np.ndarray) -> np.ndarray:
     closed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
     dilated = cv2.dilate(closed, kernel, iterations=1)
     return (dilated > 0).astype(np.uint8)
+
+
+def extract_padded_crop_mask(
+    binary_mask: np.ndarray, bbox: Tuple[int, int, int, int], out_size: int
+) -> np.ndarray:
+    """Crop and resize a binary mask using the same bbox/padding as the high-res branch."""
+
+    if out_size <= 0:
+        raise ValueError("Output size for cropped mask must be positive")
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    height, width = binary_mask.shape
+    x0 = max(0, min(x0, width - 1))
+    y0 = max(0, min(y0, height - 1))
+    x1 = max(x0, min(x1, width - 1))
+    y1 = max(y0, min(y1, height - 1))
+    crop = binary_mask[y0 : y1 + 1, x0 : x1 + 1]
+    pil_mask = Image.fromarray((crop > 0).astype(np.uint8) * 255)
+    if pil_mask.size != (out_size, out_size):
+        pil_mask = pil_mask.resize((out_size, out_size), Image.NEAREST)
+    resized = np.array(pil_mask, dtype=np.uint8)
+    return (resized > 127).astype(np.float32)
 
 
 def get_text_query_indices(input_ids: List[int], special_ids: Set[int], vision_start: int, vision_end: int) -> List[int]:
@@ -476,11 +509,21 @@ def prepare_msgs(
 
 def prepare_inputs(
     processor: AutoProcessor, msgs: List[Dict[str, object]]
-) -> Tuple[Dict[str, torch.Tensor], Tuple[int, int], Tuple[int, int], List[int], Set[int]]:
-    """Tokenise inputs and extract vision token span metadata."""
+) -> Tuple[
+    Dict[str, torch.Tensor],
+    List[Tuple[int, int]],
+    List[Tuple[int, int]],
+    List[int],
+    Set[int],
+]:
+    """Tokenise inputs and extract metadata for all vision token spans."""
 
     image_inputs, _ = process_vision_info(msgs)
-    grid_shape = get_grid_shape_fn(processor, image_inputs)
+    grid_shapes_per_image: List[Tuple[int, int]] = []
+    for idx, image in enumerate(image_inputs):
+        grid_shape = get_grid_shape_fn(processor, [image])
+        grid_shapes_per_image.append(grid_shape)
+        LOGGER.debug("Grid shape for image %d: %s", idx, grid_shape)
     text_prompt = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[text_prompt], images=image_inputs, padding=True, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
@@ -490,17 +533,48 @@ def prepare_inputs(
     input_ids = inputs["input_ids"][0].tolist()
     if vision_start_token_id not in input_ids or vision_end_token_id not in input_ids:
         raise ValueError("Vision boundary tokens not found in the input sequence")
-    vision_start = input_ids.index(vision_start_token_id) + 1
-    vision_end = input_ids.index(vision_end_token_id)
+
+    starts: List[int] = []
+    ends: List[int] = []
+    for idx, token_id in enumerate(input_ids):
+        if token_id == vision_start_token_id:
+            starts.append(idx + 1)
+        elif token_id == vision_end_token_id:
+            ends.append(idx)
+    if len(starts) != len(ends):
+        raise ValueError(
+            f"Mismatch between vision start ({len(starts)}) and end ({len(ends)}) tokens"
+        )
+    if len(starts) != len(image_inputs):
+        raise ValueError(
+            "Number of vision spans does not match number of image inputs"
+        )
+    vision_spans: List[Tuple[int, int]] = []
+    end_cursor = 0
+    for start in starts:
+        while end_cursor < len(ends) and ends[end_cursor] < start:
+            end_cursor += 1
+        if end_cursor >= len(ends):
+            raise ValueError("Unable to match vision start token with an end token")
+        end = ends[end_cursor]
+        end_cursor += 1
+        if end <= start:
+            raise ValueError(f"Invalid vision span ({start}, {end})")
+        vision_spans.append((start, end))
+
     special_ids = set(tokenizer.all_special_ids or [])
     LOGGER.info(
-        "Input sequence prepared: len=%d vision_start=%d vision_end=%d grid_shape=%s",
+        "Input sequence prepared: len=%d span_count=%d spans=%s grid_shapes=%s",
         len(input_ids),
-        vision_start,
-        vision_end,
-        grid_shape,
+        len(vision_spans),
+        vision_spans,
+        grid_shapes_per_image,
     )
-    return inputs, grid_shape, (vision_start, vision_end), input_ids, special_ids
+    if len(vision_spans) != len(grid_shapes_per_image):
+        raise ValueError(
+            "Vision span count does not match grid shape count from image inputs"
+        )
+    return inputs, grid_shapes_per_image, vision_spans, input_ids, special_ids
 
 
 def select_images(index: Dict[str, Dict[int, Dict[str, object]]], image_ids_arg: str, n_samples: int) -> List[int]:
@@ -617,6 +691,7 @@ def main() -> None:
 
             highres_patch: Optional[Image.Image] = None
             enable_hires = False
+            bbox: Optional[Tuple[int, int, int, int]] = None
             if args.hires_crop_size > 0 and (args.small_mask_thr <= 0 or area < args.small_mask_thr):
                 try:
                     bbox = compute_mask_bbox(binary_mask, padding=0.05)
@@ -640,12 +715,29 @@ def main() -> None:
 
             msgs = prepare_msgs(img_path, prompt, highres_patch)
             try:
-                inputs, grid_shape, (vision_start, vision_end), input_ids, special_ids = prepare_inputs(processor, msgs)
+                inputs, grid_shapes, vision_spans, input_ids, special_ids = prepare_inputs(processor, msgs)
             except ValueError as exc:
                 LOGGER.warning("Failed to prepare inputs for image %s seg %s: %s", image_id, seg_id, exc)
                 continue
 
-            query_indices = get_text_query_indices(input_ids, special_ids, vision_start, vision_end)
+            if not vision_spans:
+                LOGGER.warning("No vision spans detected for image %s seg %s", image_id, seg_id)
+                continue
+
+            span_count = len(vision_spans)
+            if len(grid_shapes) != span_count:
+                LOGGER.error(
+                    "Span count %d does not match grid shape count %d for image %s seg %s",
+                    span_count,
+                    len(grid_shapes),
+                    image_id,
+                    seg_id,
+                )
+                continue
+
+            vision_min_start = min(span[0] for span in vision_spans)
+            vision_max_end = max(span[1] for span in vision_spans)
+            query_indices = get_text_query_indices(input_ids, special_ids, vision_min_start, vision_max_end)
             head_sample = query_indices[:3]
             tail_sample = query_indices[-3:] if len(query_indices) > 3 else query_indices[:]
             LOGGER.info(
@@ -655,8 +747,66 @@ def main() -> None:
                 tail_sample,
             )
 
+            use_highres_span = enable_hires and highres_patch is not None and span_count >= 2
+            if args.span_idx is not None:
+                if args.span_idx < 0 or args.span_idx >= span_count:
+                    LOGGER.error(
+                        "Requested span_idx %s out of bounds for %d spans", args.span_idx, span_count
+                    )
+                    continue
+                span_idx = args.span_idx
+            elif use_highres_span and args.hires_only:
+                span_idx = 1
+            elif use_highres_span:
+                span_idx = 1
+            else:
+                span_idx = 0
+
+            if span_idx >= span_count:
+                LOGGER.warning(
+                    "Adjusted span index %d exceeds available spans %d for image %s seg %s",
+                    span_idx,
+                    span_count,
+                    image_id,
+                    seg_id,
+                )
+                span_idx = span_count - 1
+
+            vision_start, vision_end = vision_spans[span_idx]
+            grid_shape = grid_shapes[span_idx]
             h_tok, w_tok = grid_shape
-            mask_tokens = downsample_mask_to_tokens(binary_mask, h_tok, w_tok)
+            if vision_end - vision_start <= 0 or h_tok * w_tok <= 0:
+                LOGGER.warning(
+                    "Invalid vision span or grid shape for image %s seg %s: span=%s grid=%s",
+                    image_id,
+                    seg_id,
+                    vision_spans[span_idx],
+                    grid_shape,
+                )
+                continue
+
+            LOGGER.info(
+                "Chosen vision span idx=%d/%d span=%s grid_shape=%s",
+                span_idx,
+                span_count,
+                vision_spans[span_idx],
+                grid_shape,
+            )
+
+            if use_highres_span and span_idx == 1 and bbox is not None and args.hires_crop_size > 0:
+                try:
+                    mask_patch = extract_padded_crop_mask(binary_mask, bbox, args.hires_crop_size)
+                    mask_tokens = downsample_mask_to_tokens(mask_patch, h_tok, w_tok)
+                except ValueError as exc:
+                    LOGGER.warning(
+                        "Failed to align high-res mask for image %s seg %s: %s; falling back to full mask",
+                        image_id,
+                        seg_id,
+                        exc,
+                    )
+                    mask_tokens = downsample_mask_to_tokens(binary_mask, h_tok, w_tok)
+            else:
+                mask_tokens = downsample_mask_to_tokens(binary_mask, h_tok, w_tok)
             if mask_tokens.sum() <= 0:
                 LOGGER.debug("Token mask empty after downsampling for image %s seg %s", image_id, seg_id)
                 continue
@@ -751,17 +901,39 @@ def main() -> None:
             attn_pre_np = token_attention_to_map(token_att_pre.detach(), grid_shape).cpu().numpy()
             attn_post_np = token_attention_to_map(token_att_post.detach(), grid_shape).cpu().numpy()
 
-            overlay_pre = draw_overlay_heatmap(image, upsample_attn_to_image(attn_pre_np, image.height, image.width))
-            overlay_post = draw_overlay_heatmap(image, upsample_attn_to_image(attn_post_np, image.height, image.width))
+            full_heat_pre: np.ndarray
+            full_heat_post: np.ndarray
+            if use_highres_span and span_idx == 1 and bbox is not None:
+                x0, y0, x1, y1 = bbox
+                bbox_w = max(1, int(x1 - x0 + 1))
+                bbox_h = max(1, int(y1 - y0 + 1))
+                full_heat_pre = np.zeros((image.height, image.width), dtype=np.float32)
+                full_heat_post = np.zeros_like(full_heat_pre)
+                pre_roi = upsample_attn_to_image(attn_pre_np, bbox_h, bbox_w)
+                post_roi = upsample_attn_to_image(attn_post_np, bbox_h, bbox_w)
+                full_heat_pre[y0 : y1 + 1, x0 : x1 + 1] = pre_roi
+                full_heat_post[y0 : y1 + 1, x0 : x1 + 1] = post_roi
+            else:
+                full_heat_pre = upsample_attn_to_image(attn_pre_np, image.height, image.width)
+                full_heat_post = upsample_attn_to_image(attn_post_np, image.height, image.width)
+
+            overlay_pre = draw_overlay_heatmap(image, full_heat_pre)
+            overlay_post = draw_overlay_heatmap(image, full_heat_post)
 
             prefix = f"{seg_id}_{cat_slug}"
+            save_image_safe(overlay_pre, out_dir / f"{prefix}_pre_overlay.png")
+            save_image_safe(overlay_post, out_dir / f"{prefix}_post_overlay.png")
             if args.save_all:
-                save_image_safe(overlay_pre, out_dir / f"{prefix}_pre_overlay.png")
-                save_image_safe(overlay_post, out_dir / f"{prefix}_post_overlay.png")
                 save_token_map(attn_pre_np, out_dir / f"{prefix}_pre_token.png")
                 save_token_map(attn_post_np, out_dir / f"{prefix}_post_token.png")
-            else:
-                save_image_safe(overlay_post, out_dir / f"{prefix}_post_overlay.png")
+
+            if use_highres_span and span_idx == 1 and highres_patch is not None and args.hires_crop_size > 0:
+                crop_heat_pre = upsample_attn_to_image(attn_pre_np, args.hires_crop_size, args.hires_crop_size)
+                crop_heat_post = upsample_attn_to_image(attn_post_np, args.hires_crop_size, args.hires_crop_size)
+                overlay_crop_pre = draw_overlay_heatmap(highres_patch, crop_heat_pre)
+                overlay_crop_post = draw_overlay_heatmap(highres_patch, crop_heat_post)
+                save_image_safe(overlay_crop_pre, out_dir / f"{prefix}_crop_pre_overlay.png")
+                save_image_safe(overlay_crop_post, out_dir / f"{prefix}_crop_post_overlay.png")
 
             npz_path = out_dir / f"{prefix}_attn.npz"
             try:
@@ -780,6 +952,11 @@ def main() -> None:
             kv_meta_out.update({
                 "ratio_before": ratio_before,
                 "ratio_after": ratio_after,
+                "span_idx": int(span_idx),
+                "span_count": int(span_count),
+                "spans": [[int(s), int(e)] for (s, e) in vision_spans],
+                "grid_shapes_per_image": [[int(h), int(w)] for (h, w) in grid_shapes],
+                "chosen_grid_shape": [int(h_tok), int(w_tok)],
             })
             try:
                 ensure_dir(kv_meta_path.parent)
